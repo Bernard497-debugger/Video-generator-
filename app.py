@@ -1,35 +1,45 @@
 import os
-import requests
-import json
-import time
-import base64
+import tempfile
+import torch
 from flask import Flask, render_template, request, jsonify, url_for, send_file
 from datetime import datetime
-from io import BytesIO
-import tempfile
 import traceback
+import shutil
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-
-# Configuration
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
-
-# Hugging Face API Configuration
-HF_API_TOKEN = os.environ.get('HF_API_TOKEN')  # Get token from https://huggingface.co/settings/tokens
-if not HF_API_TOKEN:
-    print("⚠️ WARNING: HF_API_TOKEN not set! Please set it in Render environment variables.")
-
-# Available free models on Hugging Face
-MODELS = {
-    'text_to_video': 'damo-vilab/text-to-video-ms-1.7b',
-    'image_to_video': 'ali-vilab/modelscope-damo-text-to-video-synthesis',
-    'zero_scope': 'cerspense/zeroscope_v2_576w',
-    'animatediff': 'wyw3d/AnimateDiff'
-}
 
 # Create templates folder
 os.makedirs('templates', exist_ok=True)
+
+# Global variable to cache the model
+model_pipe = None
+
+def get_model():
+    """Load model once and cache it"""
+    global model_pipe
+    if model_pipe is None:
+        try:
+            from diffusers import DiffusionPipeline
+            from diffusers.utils import export_to_video
+            
+            print("🔄 Loading Zeroscope model... This may take 2-3 minutes on first load")
+            
+            # Use CPU - works on Render free tier
+            model_pipe = DiffusionPipeline.from_pretrained(
+                "cerspense/zeroscope_v2_576w",
+                torch_dtype=torch.float32
+            ).to("cpu")
+            
+            print("✅ Model loaded successfully!")
+            
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            raise
+    
+    return model_pipe
 
 # HTML Template
 INDEX_TEMPLATE = '''
@@ -38,7 +48,7 @@ INDEX_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Video Generator - Hugging Face API</title>
+    <title>AI Video Generator - Free & Local</title>
     <style>
         * {
             margin: 0;
@@ -78,8 +88,39 @@ INDEX_TEMPLATE = '''
             opacity: 0.9;
         }
         
+        .badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+        
         .content {
             padding: 40px;
+        }
+        
+        .info-box {
+            background: #e7f3ff;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .info-box h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        
+        .info-box ul {
+            margin-left: 20px;
+            color: #555;
+        }
+        
+        .info-box li {
+            margin: 5px 0;
         }
         
         .form-group {
@@ -137,7 +178,7 @@ INDEX_TEMPLATE = '''
         .loading {
             display: none;
             text-align: center;
-            padding: 20px;
+            padding: 30px;
         }
         
         .spinner {
@@ -147,7 +188,7 @@ INDEX_TEMPLATE = '''
             width: 50px;
             height: 50px;
             animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
+            margin: 0 auto 15px;
         }
         
         @keyframes spin {
@@ -185,10 +226,10 @@ INDEX_TEMPLATE = '''
             border: 1px solid #f5c6cb;
         }
         
-        .alert-info {
-            background: #d1ecf1;
-            color: #0c5460;
-            border: 1px solid #bee5eb;
+        .alert-warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
         }
         
         .download-btn {
@@ -198,22 +239,28 @@ INDEX_TEMPLATE = '''
             text-decoration: none;
             padding: 10px 20px;
             border-radius: 5px;
-            margin-top: 10px;
+            margin-top: 15px;
             text-align: center;
         }
         
-        .info-box {
-            background: #e7f3ff;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-size: 14px;
+        .example-prompts {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 10px;
         }
         
-        .info-box code {
-            background: #fff;
-            padding: 2px 5px;
-            border-radius: 3px;
+        .example-prompt {
+            background: #f0f0f0;
+            padding: 5px 12px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.2s;
+        }
+        
+        .example-prompt:hover {
+            background: #e0e0e0;
         }
         
         @media (max-width: 768px) {
@@ -231,41 +278,47 @@ INDEX_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>🎬 AI Video Generator</h1>
-            <p>Powered by Hugging Face AI Models</p>
+            <p>Powered by Zeroscope v2 - Runs entirely on CPU</p>
+            <div class="badge">✨ No API Keys Required | Free & Open Source</div>
         </div>
         
         <div class="content">
             <div id="alertContainer"></div>
             
             <div class="info-box">
-                ℹ️ <strong>Free API Info:</strong> Using Hugging Face's free inference API. 
-                First request may take 30-60 seconds as models load. 
-                <strong>Get your free token:</strong> <a href="https://huggingface.co/settings/tokens" target="_blank">huggingface.co/settings/tokens</a>
+                <h3>ℹ️ How it works</h3>
+                <ul>
+                    <li>✓ Uses Zeroscope v2 AI model running locally on CPU</li>
+                    <li>✓ No API keys or external services needed</li>
+                    <li>✓ First generation takes 2-3 minutes (model loading)</li>
+                    <li>✓ Subsequent generations take 30-60 seconds</li>
+                    <li>✓ Videos are 576p resolution, 16 frames</li>
+                </ul>
             </div>
             
             <form id="videoForm">
                 <div class="form-group">
-                    <label>🤖 Select AI Model:</label>
-                    <select name="model" id="modelSelect">
-                        <option value="text_to_video">Text to Video (Damo-Vilab)</option>
-                        <option value="zero_scope">ZeroScope v2 (576p)</option>
-                        <option value="animatediff">AnimateDiff</option>
-                    </select>
-                </div>
-                
-                <div class="form-group">
                     <label>📝 Enter your prompt:</label>
-                    <textarea name="prompt" required placeholder="Describe the video you want to generate...&#10;&#10;Example: 'A beautiful sunset over mountains with birds flying'"></textarea>
+                    <textarea name="prompt" id="prompt" required placeholder="Describe the video you want to generate...&#10;&#10;Example: 'A beautiful sunset over mountains with birds flying'"></textarea>
+                    <div class="example-prompts">
+                        <span class="example-prompt" onclick="setPrompt('A dog running on a sunny beach')">🐕 Dog on beach</span>
+                        <span class="example-prompt" onclick="setPrompt('A cat playing with a ball of yarn')">🐱 Cat playing</span>
+                        <span class="example-prompt" onclick="setPrompt('A car driving through a rainy city street')">🚗 Rainy city</span>
+                        <span class="example-prompt" onclick="setPrompt('A spaceship flying through colorful nebula')">🚀 Spaceship</span>
+                        <span class="example-prompt" onclick="setPrompt('A butterfly flying over a flower garden')">🦋 Butterfly</span>
+                    </div>
                 </div>
                 
                 <div class="form-group">
-                    <label>🎨 Negative prompt (optional):</label>
-                    <textarea name="negative_prompt" placeholder="What to avoid...&#10;&#10;Example: 'low quality, blurry, distorted'"></textarea>
+                    <label>🎬 Number of frames (4-24, more frames = longer but slower):</label>
+                    <input type="range" name="num_frames" id="num_frames" min="8" max="24" step="4" value="16">
+                    <span id="framesValue" style="display: inline-block; margin-left: 10px;">16 frames (~1.5 seconds)</span>
                 </div>
                 
                 <div class="form-group">
-                    <label>⏱️ Number of frames (optional):</label>
-                    <input type="number" name="num_frames" placeholder="16 or 24" min="8" max="48" step="8">
+                    <label>⚙️ Inference steps (15-50, more steps = better quality but slower):</label>
+                    <input type="range" name="num_steps" id="num_steps" min="15" max="50" step="5" value="25">
+                    <span id="stepsValue" style="display: inline-block; margin-left: 10px;">25 steps</span>
                 </div>
                 
                 <button type="submit" id="generateBtn">🚀 Generate Video</button>
@@ -273,8 +326,8 @@ INDEX_TEMPLATE = '''
             
             <div class="loading" id="loading">
                 <div class="spinner"></div>
-                <p>🎥 Generating your video with AI... This may take 30-60 seconds</p>
-                <p style="font-size: 12px; margin-top: 10px;">Models are loading on first request</p>
+                <p id="loadingText">🎥 Generating your video with AI...</p>
+                <p style="font-size: 12px; margin-top: 10px; color: #666;">First generation loads the model (2-3 min). Please be patient!</p>
             </div>
             
             <div class="result" id="result">
@@ -282,7 +335,7 @@ INDEX_TEMPLATE = '''
                 <video id="videoPlayer" controls>
                     Your browser does not support the video tag.
                 </video>
-                <div style="text-align: center; margin-top: 15px;">
+                <div style="text-align: center;">
                     <a id="downloadLink" class="download-btn">📥 Download Video</a>
                 </div>
             </div>
@@ -290,31 +343,45 @@ INDEX_TEMPLATE = '''
     </div>
     
     <script>
-        const form = document.getElementById('videoForm');
-        const loading = document.getElementById('loading');
-        const result = document.getElementById('result');
-        const videoPlayer = document.getElementById('videoPlayer');
-        const downloadLink = document.getElementById('downloadLink');
-        const alertContainer = document.getElementById('alertContainer');
-        const generateBtn = document.getElementById('generateBtn');
+        // Update slider values
+        document.getElementById('num_frames').addEventListener('input', function() {
+            document.getElementById('framesValue').textContent = this.value + ' frames (~' + (this.value / 10.7).toFixed(1) + ' seconds)';
+        });
+        
+        document.getElementById('num_steps').addEventListener('input', function() {
+            document.getElementById('stepsValue').textContent = this.value + ' steps';
+        });
+        
+        function setPrompt(text) {
+            document.getElementById('prompt').value = text;
+        }
         
         function showAlert(message, type) {
+            const alertContainer = document.getElementById('alertContainer');
             alertContainer.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
             setTimeout(() => {
                 alertContainer.innerHTML = '';
             }, 5000);
         }
         
+        const form = document.getElementById('videoForm');
+        const loading = document.getElementById('loading');
+        const result = document.getElementById('result');
+        const videoPlayer = document.getElementById('videoPlayer');
+        const downloadLink = document.getElementById('downloadLink');
+        const generateBtn = document.getElementById('generateBtn');
+        const loadingText = document.getElementById('loadingText');
+        
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             
-            // Hide previous result
             result.style.display = 'none';
             loading.style.display = 'block';
             generateBtn.disabled = true;
+            loadingText.textContent = '🎥 Generating your video with AI... This may take 30-60 seconds';
             
-            // Collect form data
             const formData = new FormData(form);
+            const startTime = Date.now();
             
             try {
                 const response = await fetch('/generate_video', {
@@ -323,14 +390,13 @@ INDEX_TEMPLATE = '''
                 });
                 
                 const data = await response.json();
+                const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(1);
                 
                 if (data.success) {
-                    showAlert('✅ Video generated successfully!', 'success');
+                    showAlert(`✅ Video generated in ${elapsedTime} seconds!`, 'success');
                     videoPlayer.src = data.video_url;
                     downloadLink.href = data.video_url;
                     result.style.display = 'block';
-                    
-                    // Scroll to video
                     result.scrollIntoView({ behavior: 'smooth' });
                 } else {
                     showAlert('❌ Error: ' + data.error, 'error');
@@ -343,203 +409,100 @@ INDEX_TEMPLATE = '''
             }
         });
         
-        // Check API status on load
-        async function checkAPI() {
-            const response = await fetch('/api_status');
+        // Check if model is loaded on page load
+        async function checkStatus() {
+            const response = await fetch('/model_status');
             const data = await response.json();
-            if (!data.has_token) {
-                showAlert('⚠️ API token not configured. Please set HF_API_TOKEN in environment variables.', 'info');
+            if (data.loaded) {
+                showAlert('✅ Model is loaded and ready!', 'success');
+            } else {
+                showAlert('⏳ Model will load on first video generation', 'warning');
             }
         }
         
-        checkAPI();
+        checkStatus();
     </script>
 </body>
 </html>
 '''
 
-# Create template
+# Save template
 with open('templates/index.html', 'w') as f:
     f.write(INDEX_TEMPLATE)
-
-class HuggingFaceVideoGenerator:
-    def __init__(self, api_token):
-        self.api_token = api_token
-        self.headers = {"Authorization": f"Bearer {api_token}"}
-    
-    def query(self, model_id, payload):
-        """Query Hugging Face API"""
-        api_url = f"https://api-inference.huggingface.co/models/{model_id}"
-        
-        try:
-            response = requests.post(api_url, headers=self.headers, json=payload, timeout=120)
-            
-            # Handle model loading
-            if response.status_code == 503:
-                # Model is loading, wait and retry
-                wait_time = 20
-                return {
-                    'status': 'loading',
-                    'message': f"Model is loading. Please wait {wait_time} seconds...",
-                    'wait_time': wait_time
-                }
-            
-            if response.status_code == 200:
-                return {
-                    'status': 'success',
-                    'content': response.content
-                }
-            else:
-                return {
-                    'status': 'error',
-                    'message': f"API Error {response.status_code}: {response.text}"
-                }
-        except requests.exceptions.Timeout:
-            return {
-                'status': 'error',
-                'message': "Request timed out. The model might be slow. Try again."
-            }
-        except Exception as e:
-            return {
-                'status': 'error',
-                'message': str(e)
-            }
-    
-    def generate_text_video(self, prompt, negative_prompt=None, num_frames=None):
-        """Generate video from text prompt"""
-        # Prepare payload based on model
-        payload = {
-            "inputs": prompt,
-            "parameters": {}
-        }
-        
-        if negative_prompt:
-            payload["parameters"]["negative_prompt"] = negative_prompt
-        
-        if num_frames:
-            payload["parameters"]["num_frames"] = num_frames
-        
-        # Use different models based on what's available
-        models_to_try = [
-            "damo-vilab/text-to-video-ms-1.7b",
-            "cerspense/zeroscope_v2_576w",
-            "ali-vilab/modelscope-damo-text-to-video-synthesis"
-        ]
-        
-        for model in models_to_try:
-            result = self.query(model, payload)
-            if result['status'] == 'success':
-                return result
-            elif result['status'] == 'loading':
-                return result
-        
-        return {
-            'status': 'error',
-            'message': "All models failed. Please try again later."
-        }
-    
-    def generate_with_model(self, model_name, prompt, negative_prompt=None, num_frames=None):
-        """Generate with specific model"""
-        model_path = MODELS.get(model_name, MODELS['text_to_video'])
-        
-        payload = {
-            "inputs": prompt,
-            "parameters": {}
-        }
-        
-        if negative_prompt:
-            payload["parameters"]["negative_prompt"] = negative_prompt
-        
-        if num_frames:
-            payload["parameters"]["num_frames"] = num_frames
-        
-        result = self.query(model_path, payload)
-        
-        # Handle model loading - wait and retry
-        if result['status'] == 'loading' and result.get('wait_time'):
-            # Wait for model to load
-            time.sleep(result['wait_time'])
-            # Retry once
-            result = self.query(model_path, payload)
-        
-        return result
 
 # Flask Routes
 @app.route('/')
 def index():
     return render_template('index.html')
 
-@app.route('/api_status')
-def api_status():
-    return jsonify({
-        'has_token': bool(HF_API_TOKEN),
-        'models_available': list(MODELS.keys())
-    })
+@app.route('/model_status')
+def model_status():
+    """Check if model is loaded"""
+    return jsonify({'loaded': model_pipe is not None})
 
 @app.route('/generate_video', methods=['POST'])
 def generate_video():
-    if not HF_API_TOKEN:
-        return jsonify({
-            'success': False,
-            'error': 'Hugging Face API token not configured. Please set HF_API_TOKEN environment variable.'
-        })
-    
+    """Generate video using Zeroscope model"""
     try:
         prompt = request.form.get('prompt')
         if not prompt:
             return jsonify({'success': False, 'error': 'Prompt is required'})
         
-        negative_prompt = request.form.get('negative_prompt')
-        num_frames = request.form.get('num_frames')
-        model_name = request.form.get('model', 'text_to_video')
+        num_frames = int(request.form.get('num_frames', 16))
+        num_steps = int(request.form.get('num_steps', 25))
         
-        if num_frames:
-            num_frames = int(num_frames)
+        # Limits for CPU performance
+        num_frames = min(max(num_frames, 8), 24)
+        num_steps = min(max(num_steps, 15), 40)
         
-        # Initialize generator
-        generator = HuggingFaceVideoGenerator(HF_API_TOKEN)
+        print(f"🎬 Generating: '{prompt}' | Frames: {num_frames} | Steps: {num_steps}")
+        
+        # Get the model (loads if not already loaded)
+        try:
+            pipe = get_model()
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Failed to load model: {str(e)}'})
         
         # Generate video
-        result = generator.generate_with_model(model_name, prompt, negative_prompt, num_frames)
+        from diffusers.utils import export_to_video
         
-        if result['status'] == 'success':
-            # Save video to temp file
-            temp_dir = tempfile.gettempdir()
-            filename = f"ai_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-            filepath = os.path.join(temp_dir, filename)
-            
-            with open(filepath, 'wb') as f:
-                f.write(result['content'])
-            
-            # Create download URL
-            video_url = url_for('download_video', filename=filename, _external=True)
-            
-            return jsonify({
-                'success': True,
-                'video_url': video_url,
-                'filename': filename,
-                'file_size': len(result['content']),
-                'message': 'Video generated successfully!'
-            })
+        print("🔄 Running inference...")
+        result = pipe(
+            prompt,
+            num_frames=num_frames,
+            num_inference_steps=num_steps,
+            height=320,  # Smaller for faster generation on CPU
+            width=576
+        )
         
-        elif result['status'] == 'loading':
-            return jsonify({
-                'success': False,
-                'error': f"Model is loading. Please wait 30 seconds and try again. {result.get('message', '')}"
-            })
+        video_frames = result.frames[0]
         
-        else:
-            return jsonify({
-                'success': False,
-                'error': result.get('message', 'Unknown error occurred')
-            })
-            
+        # Save video
+        temp_dir = tempfile.gettempdir()
+        filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        filepath = os.path.join(temp_dir, filename)
+        
+        export_to_video(video_frames, filepath, fps=8)
+        
+        # Check if file was created
+        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+            return jsonify({'success': False, 'error': 'Video file is empty'})
+        
+        video_url = url_for('download_video', filename=filename, _external=True)
+        
+        print(f"✅ Video saved: {filepath} ({os.path.getsize(filepath)} bytes)")
+        
+        return jsonify({
+            'success': True,
+            'video_url': video_url,
+            'filename': filename,
+            'frames': num_frames,
+            'steps': num_steps
+        })
+        
     except Exception as e:
         traceback.print_exc()
-        return jsonify({
-            'success': False,
-            'error': f'Error: {str(e)}'
-        })
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/download/<filename>')
 def download_video(filename):
@@ -551,14 +514,14 @@ def download_video(filename):
 
 @app.route('/cleanup', methods=['POST'])
 def cleanup():
-    """Clean up old video files (older than 1 hour)"""
+    """Clean up old video files"""
     try:
         temp_dir = tempfile.gettempdir()
-        current_time = time.time()
+        current_time = datetime.now().timestamp()
         deleted = 0
         
         for filename in os.listdir(temp_dir):
-            if filename.startswith('ai_video_') and filename.endswith('.mp4'):
+            if filename.startswith('video_') and filename.endswith('.mp4'):
                 filepath = os.path.join(temp_dir, filename)
                 if current_time - os.path.getmtime(filepath) > 3600:
                     os.remove(filepath)
@@ -568,40 +531,18 @@ def cleanup():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
-# Test endpoint to check if API is working
-@app.route('/test_model')
-def test_model():
-    """Test if Hugging Face API is accessible"""
-    if not HF_API_TOKEN:
-        return jsonify({'error': 'No API token configured'})
-    
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    api_url = "https://api-inference.huggingface.co/models/damo-vilab/text-to-video-ms-1.7b"
-    
-    try:
-        # Test with a simple request
-        response = requests.get(api_url, headers=headers)
-        return jsonify({
-            'status': 'connected',
-            'response_code': response.status_code,
-            'model_status': 'loading' if response.status_code == 503 else 'ready'
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)})
-
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
-    if not HF_API_TOKEN:
-        print("\n" + "="*50)
-        print("⚠️  WARNING: HF_API_TOKEN not set!")
-        print("To use this app, you need a Hugging Face API token:")
-        print("1. Sign up at https://huggingface.co/join")
-        print("2. Get your token at https://huggingface.co/settings/tokens")
-        print("3. Set it as environment variable: export HF_API_TOKEN='your_token_here'")
-        print("="*50 + "\n")
+    print("\n" + "="*60)
+    print("🎬 AI Video Generator - Zeroscope v2")
+    print("="*60)
+    print("\n📝 Features:")
+    print("   • No API keys required")
+    print("   • Runs entirely on CPU")
+    print("   • First load takes 2-3 minutes")
+    print("   • Each video: 30-60 seconds generation time")
+    print(f"\n🌐 Open: http://0.0.0.0:{port}")
+    print("="*60 + "\n")
     
-    print("🎬 AI Video Generator Started!")
-    print(f"📱 Open your browser and go to: http://0.0.0.0:{port}")
-    print("✨ Generating videos with Hugging Face AI")
     app.run(host='0.0.0.0', port=port, debug=False)
